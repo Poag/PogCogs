@@ -78,6 +78,43 @@ class GameLog(commands.Cog):
                 "Enable both in the Discord developer portal and in Red's intents "
                 "settings, then restart the bot, or game activity will never be seen."
             )
+        asyncio.create_task(self._backfill_names())
+
+    async def _backfill_names(self) -> None:
+        """One-shot catch-up on load/reload.
+
+        on_presence_update only ever refreshes a name when someone
+        actually starts or stops a game - so anyone already mid-session
+        before this cache existed (or before the most recent restart)
+        would otherwise show a placeholder indefinitely, not just until
+        their game ends. Backfilling from the current member list on
+        every load closes that gap immediately instead of waiting on
+        activity.
+        """
+        await self.bot.wait_until_ready()
+        now = int(discord.utils.utcnow().timestamp())
+        user_rows = [
+            (guild.id, member.id, member.display_name, now)
+            for guild in self.bot.guilds
+            for member in guild.members
+            if not member.bot
+        ]
+        if not user_rows:
+            return
+
+        def _upsert() -> None:
+            self._db.executemany(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                user_rows,
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
+        log.info(f"GameLog: backfilled {len(user_rows)} member name(s).")
 
     @staticmethod
     def _playing_games(member: discord.Member) -> set:

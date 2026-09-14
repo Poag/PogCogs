@@ -92,6 +92,59 @@ class VoiceLog(commands.Cog):
                 "VoiceLog requires the Voice States intent to log voice channel "
                 "activity. Enable it in Red's intents settings, then restart the bot."
             )
+        asyncio.create_task(self._backfill_names())
+
+    async def _backfill_names(self) -> None:
+        """One-shot catch-up on load/reload.
+
+        on_voice_state_update only ever refreshes a name when someone
+        actually joins, leaves, or moves - so anyone who was already
+        sitting in a channel before this cache existed (or before the
+        most recent restart) would otherwise show a placeholder
+        indefinitely, not just until their next real event. Backfilling
+        from the current member/channel list on every load closes that
+        gap immediately instead of waiting on activity.
+        """
+        await self.bot.wait_until_ready()
+        now = int(discord.utils.utcnow().timestamp())
+        user_rows = []
+        channel_rows = []
+        for guild in self.bot.guilds:
+            user_rows.extend(
+                (guild.id, member.id, member.display_name, now)
+                for member in guild.members
+                if not member.bot
+            )
+            channel_rows.extend(
+                (guild.id, channel.id, channel.name, now)
+                for channel in (*guild.voice_channels, *guild.stage_channels)
+            )
+        if not user_rows and not channel_rows:
+            return
+
+        def _upsert() -> None:
+            self._db.executemany(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                user_rows,
+            )
+            self._db.executemany(
+                "INSERT INTO channel_names (guild_id, channel_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, channel_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                channel_rows,
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
+        log.info(
+            f"VoiceLog: backfilled {len(user_rows)} member name(s) and "
+            f"{len(channel_rows)} channel name(s)."
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(
