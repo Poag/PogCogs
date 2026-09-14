@@ -23,6 +23,13 @@ class VoiceLog(commands.Cog):
     table (matching ``user_id``, overlapping time) shows what game someone
     was playing during a given voice session. Those joins are the intended
     basis for a relationship graph built from this data.
+
+    Also opportunistically caches display names in ``user_names``,
+    ``channel_names``, and ``guild_names`` - all three only ever store a
+    Discord *ID*, so anything consuming this database directly (e.g. a
+    dashboard) needs a name to show; refreshed from whichever
+    member/channel/guild objects are already in hand on every voice
+    state update rather than a separate lookup.
     """
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -50,6 +57,37 @@ class VoiceLog(commands.Cog):
             "CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel_time "
             "ON voice_sessions (guild_id, channel_id, start_time, end_time)"
         )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_names (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_names (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_names (
+                guild_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         self._db.commit()
         self._db_lock = asyncio.Lock()
         # (guild_id, user_id) -> (channel_id, when that voice session started)
@@ -64,6 +102,68 @@ class VoiceLog(commands.Cog):
                 "VoiceLog requires the Voice States intent to log voice channel "
                 "activity. Enable it in Red's intents settings, then restart the bot."
             )
+        asyncio.create_task(self._backfill_names())
+
+    async def _backfill_names(self) -> None:
+        """One-shot catch-up on load/reload.
+
+        on_voice_state_update only ever refreshes a name when someone
+        actually joins, leaves, or moves - so anyone who was already
+        sitting in a channel before this cache existed (or before the
+        most recent restart) would otherwise show a placeholder
+        indefinitely, not just until their next real event. Backfilling
+        from the current member/channel list on every load closes that
+        gap immediately instead of waiting on activity.
+        """
+        await self.bot.wait_until_ready()
+        now = int(discord.utils.utcnow().timestamp())
+        user_rows = []
+        channel_rows = []
+        guild_rows = []
+        for guild in self.bot.guilds:
+            guild_rows.append((guild.id, guild.name, now))
+            user_rows.extend(
+                (guild.id, member.id, member.display_name, now)
+                for member in guild.members
+                if not member.bot
+            )
+            channel_rows.extend(
+                (guild.id, channel.id, channel.name, now)
+                for channel in (*guild.voice_channels, *guild.stage_channels)
+            )
+        if not user_rows and not channel_rows and not guild_rows:
+            return
+
+        def _upsert() -> None:
+            self._db.executemany(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                user_rows,
+            )
+            self._db.executemany(
+                "INSERT INTO channel_names (guild_id, channel_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, channel_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                channel_rows,
+            )
+            self._db.executemany(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                guild_rows,
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
+        log.info(
+            f"VoiceLog: backfilled {len(user_rows)} member name(s), "
+            f"{len(channel_rows)} channel name(s), and {len(guild_rows)} guild name(s)."
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -71,6 +171,8 @@ class VoiceLog(commands.Cog):
     ) -> None:
         if member.bot or before.channel == after.channel:
             return
+
+        await self._touch_names(member, before.channel, after.channel)
 
         now = discord.utils.utcnow()
         key = (member.guild.id, member.id)
@@ -87,6 +189,41 @@ class VoiceLog(commands.Cog):
 
         if after.channel is not None:
             self._active[key] = (after.channel.id, now)
+
+    async def _touch_names(self, member: discord.Member, *channels) -> None:
+        now = int(discord.utils.utcnow().timestamp())
+        channel_rows = [
+            (member.guild.id, channel.id, channel.name, now)
+            for channel in channels
+            if channel is not None
+        ]
+
+        def _upsert() -> None:
+            self._db.execute(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.id, member.display_name, now),
+            )
+            self._db.executemany(
+                "INSERT INTO channel_names (guild_id, channel_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, channel_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                channel_rows,
+            )
+            self._db.execute(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.guild.name, now),
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
 
     async def _log_session(
         self,
@@ -153,6 +290,7 @@ class VoiceLog(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         def _delete() -> None:
             self._db.execute("DELETE FROM voice_sessions WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM user_names WHERE user_id = ?", (user_id,))
             self._db.commit()
 
         async with self._db_lock:

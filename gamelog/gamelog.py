@@ -26,6 +26,13 @@ class GameLog(commands.Cog):
     join this cog's ``sessions`` table against ``voicelog``'s
     ``voice_sessions`` table on matching ``user_id`` with overlapping
     ``[start_time, end_time]`` windows.
+
+    Also opportunistically caches display names in ``user_names`` and
+    ``guild_names`` - both only ever store a Discord *ID*, so anything
+    consuming this database directly (e.g. a dashboard) needs a name to
+    show; refreshed from the member/guild objects already in hand
+    whenever a game session starts or stops, rather than a separate
+    lookup.
     """
 
     #: Seeded once on first run - non-game apps that use Discord's "Playing"
@@ -60,6 +67,26 @@ class GameLog(commands.Cog):
             "INSERT OR IGNORE INTO ignored_games (game) VALUES (?)",
             [(game,) for game in self._DEFAULT_IGNORED_GAMES],
         )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_names (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_names (
+                guild_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         self._db.commit()
         self._db_lock = asyncio.Lock()
         # (guild_id, user_id, game) -> when that session started
@@ -80,6 +107,54 @@ class GameLog(commands.Cog):
                 "Enable both in the Discord developer portal and in Red's intents "
                 "settings, then restart the bot, or game activity will never be seen."
             )
+        asyncio.create_task(self._backfill_names())
+
+    async def _backfill_names(self) -> None:
+        """One-shot catch-up on load/reload.
+
+        on_presence_update only ever refreshes a name when someone
+        actually starts or stops a game - so anyone already mid-session
+        before this cache existed (or before the most recent restart)
+        would otherwise show a placeholder indefinitely, not just until
+        their game ends. Backfilling from the current member list on
+        every load closes that gap immediately instead of waiting on
+        activity.
+        """
+        await self.bot.wait_until_ready()
+        now = int(discord.utils.utcnow().timestamp())
+        user_rows = [
+            (guild.id, member.id, member.display_name, now)
+            for guild in self.bot.guilds
+            for member in guild.members
+            if not member.bot
+        ]
+        guild_rows = [(guild.id, guild.name, now) for guild in self.bot.guilds]
+        if not user_rows and not guild_rows:
+            return
+
+        def _upsert() -> None:
+            self._db.executemany(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                user_rows,
+            )
+            self._db.executemany(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                guild_rows,
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
+        log.info(
+            f"GameLog: backfilled {len(user_rows)} member name(s) and "
+            f"{len(guild_rows)} guild name(s)."
+        )
 
     def _playing_games(self, member: discord.Member) -> set:
         return {
@@ -100,6 +175,8 @@ class GameLog(commands.Cog):
         if before_games == after_games:
             return
 
+        await self._touch_name(after)
+
         now = discord.utils.utcnow()
 
         for game in after_games - before_games:
@@ -116,6 +193,29 @@ class GameLog(commands.Cog):
             if duration <= 0:
                 continue
             await self._log_session(after.guild.id, after.id, game, start, now, duration)
+
+    async def _touch_name(self, member: discord.Member) -> None:
+        now = int(discord.utils.utcnow().timestamp())
+
+        def _upsert() -> None:
+            self._db.execute(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.id, member.display_name, now),
+            )
+            self._db.execute(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.guild.name, now),
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
 
     async def _log_session(
         self,
@@ -312,6 +412,7 @@ class GameLog(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         def _delete() -> None:
             self._db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM user_names WHERE user_id = ?", (user_id,))
             self._db.commit()
 
         async with self._db_lock:
