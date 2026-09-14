@@ -24,11 +24,12 @@ class GameLog(commands.Cog):
     ``voice_sessions`` table on matching ``user_id`` with overlapping
     ``[start_time, end_time]`` windows.
 
-    Also opportunistically caches display names in ``user_names`` - it
-    only ever stores a Discord *ID*, so anything consuming this database
-    directly (e.g. a dashboard) needs a name to show; refreshed from the
-    member object already in hand whenever a game session starts or
-    stops, rather than a separate lookup.
+    Also opportunistically caches display names in ``user_names`` and
+    ``guild_names`` - both only ever store a Discord *ID*, so anything
+    consuming this database directly (e.g. a dashboard) needs a name to
+    show; refreshed from the member/guild objects already in hand
+    whenever a game session starts or stops, rather than a separate
+    lookup.
     """
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -60,6 +61,15 @@ class GameLog(commands.Cog):
                 name TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_names (
+                guild_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             )
             """
         )
@@ -99,7 +109,8 @@ class GameLog(commands.Cog):
             for member in guild.members
             if not member.bot
         ]
-        if not user_rows:
+        guild_rows = [(guild.id, guild.name, now) for guild in self.bot.guilds]
+        if not user_rows and not guild_rows:
             return
 
         def _upsert() -> None:
@@ -110,11 +121,21 @@ class GameLog(commands.Cog):
                 "SET name = excluded.name, updated_at = excluded.updated_at",
                 user_rows,
             )
+            self._db.executemany(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                guild_rows,
+            )
             self._db.commit()
 
         async with self._db_lock:
             await asyncio.get_running_loop().run_in_executor(None, _upsert)
-        log.info(f"GameLog: backfilled {len(user_rows)} member name(s).")
+        log.info(
+            f"GameLog: backfilled {len(user_rows)} member name(s) and "
+            f"{len(guild_rows)} guild name(s)."
+        )
 
     @staticmethod
     def _playing_games(member: discord.Member) -> set:
@@ -163,6 +184,13 @@ class GameLog(commands.Cog):
                 "ON CONFLICT (guild_id, user_id) DO UPDATE "
                 "SET name = excluded.name, updated_at = excluded.updated_at",
                 (member.guild.id, member.id, member.display_name, now),
+            )
+            self._db.execute(
+                "INSERT INTO guild_names (guild_id, name, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.guild.name, now),
             )
             self._db.commit()
 
