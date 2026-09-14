@@ -30,6 +30,9 @@ Add this repository to your Red instance, then install a cog from it:
 | `[p]gamelog top <game>` | Top 10 players of a specific game, by time played. |
 | `[p]gamelog leaderboard` | Top 10 players across all games combined, by time played. |
 | `[p]gamelog games` | Every game logged in the server, sorted by total time played. |
+| `[p]gamelog ignore <game>` | Bot owner only. Stop logging a game/app bot-wide (case-insensitive) - for non-game apps that use "Playing" rich presence. Pre-seeded with `YouTube Music`, `CurseForge`, `OVR Toolkit`. |
+| `[p]gamelog unignore <game>` | Bot owner only. Resume logging a previously-ignored game/app. |
+| `[p]gamelog ignored` | List games/apps currently ignored bot-wide. |
 
 ### voicelog commands
 

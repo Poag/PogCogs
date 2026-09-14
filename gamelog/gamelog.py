@@ -16,7 +16,10 @@ class GameLog(commands.Cog):
     """Logs who's playing what game in a server, and how long each session lasts.
 
     Only "Playing" activities count as games. Other presence types (Spotify,
-    other listening/watching/streaming/custom statuses) are ignored.
+    other listening/watching/streaming/custom statuses) are ignored. Some
+    non-game apps use "Playing" rich presence too; those can be excluded
+    bot-wide with `[p]gamelog ignore` (a few are pre-seeded, see
+    `_DEFAULT_IGNORED_GAMES`).
 
     Voice channel activity is logged by the separate ``voicelog`` cog. To
     relate game activity to voice sessions (e.g. for a relationship graph),
@@ -24,6 +27,10 @@ class GameLog(commands.Cog):
     ``voice_sessions`` table on matching ``user_id`` with overlapping
     ``[start_time, end_time]`` windows.
     """
+
+    #: Seeded once on first run - non-game apps that use Discord's "Playing"
+    #: rich presence and would otherwise be logged as if they were games.
+    _DEFAULT_IGNORED_GAMES = ("YouTube Music", "CurseForge", "OVR Toolkit")
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -46,10 +53,22 @@ class GameLog(commands.Cog):
             "CREATE INDEX IF NOT EXISTS idx_sessions_guild_user_game "
             "ON sessions (guild_id, user_id, game)"
         )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS ignored_games (game TEXT PRIMARY KEY COLLATE NOCASE)"
+        )
+        self._db.executemany(
+            "INSERT OR IGNORE INTO ignored_games (game) VALUES (?)",
+            [(game,) for game in self._DEFAULT_IGNORED_GAMES],
+        )
         self._db.commit()
         self._db_lock = asyncio.Lock()
         # (guild_id, user_id, game) -> when that session started
         self._active: Dict[Tuple[int, int, str], datetime.datetime] = {}
+        # Bot-wide, case-insensitive; loaded once and kept in memory since
+        # on_presence_update fires often and shouldn't hit the DB every time.
+        self._ignored_games = {
+            game.lower() for (game,) in self._db.execute("SELECT game FROM ignored_games")
+        }
 
     def cog_unload(self) -> None:
         self._db.close()
@@ -62,12 +81,13 @@ class GameLog(commands.Cog):
                 "settings, then restart the bot, or game activity will never be seen."
             )
 
-    @staticmethod
-    def _playing_games(member: discord.Member) -> set:
+    def _playing_games(self, member: discord.Member) -> set:
         return {
             activity.name
             for activity in member.activities
-            if activity.type is discord.ActivityType.playing and activity.name
+            if activity.type is discord.ActivityType.playing
+            and activity.name
+            and activity.name.lower() not in self._ignored_games
         }
 
     @commands.Cog.listener()
@@ -232,6 +252,53 @@ class GameLog(commands.Cog):
         ]
         for page in pagify("\n".join(lines)):
             await ctx.send(box(page))
+
+    @gamelog.command(name="ignore")
+    @commands.is_owner()
+    async def gamelog_ignore(self, ctx: commands.Context, *, game: str) -> None:
+        """Stop logging a game/app, bot-wide, across every server. Case-insensitive.
+
+        For apps that use Discord's "Playing" rich presence without actually
+        being a game (e.g. launchers, overlays, media players).
+        """
+
+        def _insert() -> None:
+            self._db.execute("INSERT OR IGNORE INTO ignored_games (game) VALUES (?)", (game,))
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _insert)
+        self._ignored_games.add(game.lower())
+        await ctx.send(f"No longer logging **{game}**.")
+
+    @gamelog.command(name="unignore")
+    @commands.is_owner()
+    async def gamelog_unignore(self, ctx: commands.Context, *, game: str) -> None:
+        """Resume logging a game/app that was ignored with `[p]gamelog ignore`."""
+
+        def _delete() -> None:
+            self._db.execute("DELETE FROM ignored_games WHERE game = ?", (game,))
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _delete)
+        self._ignored_games.discard(game.lower())
+        await ctx.send(f"Resumed logging **{game}**.")
+
+    @gamelog.command(name="ignored")
+    async def gamelog_ignored(self, ctx: commands.Context) -> None:
+        """List games/apps currently ignored bot-wide."""
+        if not self._ignored_games:
+            await ctx.send("No games are currently ignored.")
+            return
+
+        def _query():
+            cur = self._db.execute("SELECT game FROM ignored_games ORDER BY game")
+            return [game for (game,) in cur.fetchall()]
+
+        async with self._db_lock:
+            games = await asyncio.get_running_loop().run_in_executor(None, _query)
+        await ctx.send("Ignored games/apps: " + ", ".join(f"`{game}`" for game in games))
 
     @staticmethod
     def _format_leaderboard(ctx: commands.Context, rows) -> str:

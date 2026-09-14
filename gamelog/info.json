@@ -1,7 +1,7 @@
 {
     "author": ["Poag"],
     "min_bot_version": "3.5.0",
-    "description": "Logs what games members are playing in a server: who's playing what, and how long each session lasts. Only 'Playing' activities count as games; other statuses (Spotify, custom statuses, streaming, watching) are ignored. Includes commands to list all games logged, the top 10 players of a given game, and the top 10 players across all games combined. Pairs with the separate voicelog cog: joining this cog's session data against voicelog's on user_id and overlapping time is the intended basis for a future relationship graph. Requires the Presence and Server Members privileged intents to be enabled for the bot.",
+    "description": "Logs what games members are playing in a server: who's playing what, and how long each session lasts. Only 'Playing' activities count as games; other statuses (Spotify, custom statuses, streaming, watching) are ignored. Non-game apps that use 'Playing' rich presence (e.g. YouTube Music, CurseForge, OVR Toolkit) can be excluded bot-wide with the ignore list. Includes commands to list all games logged, the top 10 players of a given game, and the top 10 players across all games combined. Pairs with the separate voicelog cog: joining this cog's session data against voicelog's on user_id and overlapping time is the intended basis for a future relationship graph. Requires the Presence and Server Members privileged intents to be enabled for the bot.",
     "hidden": false,
     "install_msg": "Thanks for installing GameLog! This cog requires the Presence and Server Members privileged intents to be enabled for the bot in order to see game activity - see the repo README for details.",
     "short": "Logs per-session game activity for members.",
