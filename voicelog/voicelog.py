@@ -23,6 +23,12 @@ class VoiceLog(commands.Cog):
     table (matching ``user_id``, overlapping time) shows what game someone
     was playing during a given voice session. Those joins are the intended
     basis for a relationship graph built from this data.
+
+    Also opportunistically caches display names in ``user_names`` and
+    ``channel_names`` - both only ever store a Discord *ID*, so anything
+    consuming this database directly (e.g. a dashboard) needs a name to
+    show; refreshed from whichever member/channel objects are already in
+    hand on every voice state update rather than a separate lookup.
     """
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -50,6 +56,28 @@ class VoiceLog(commands.Cog):
             "CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel_time "
             "ON voice_sessions (guild_id, channel_id, start_time, end_time)"
         )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_names (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_names (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """
+        )
         self._db.commit()
         self._db_lock = asyncio.Lock()
         # (guild_id, user_id) -> (channel_id, when that voice session started)
@@ -72,6 +100,8 @@ class VoiceLog(commands.Cog):
         if member.bot or before.channel == after.channel:
             return
 
+        await self._touch_names(member, before.channel, after.channel)
+
         now = discord.utils.utcnow()
         key = (member.guild.id, member.id)
 
@@ -87,6 +117,34 @@ class VoiceLog(commands.Cog):
 
         if after.channel is not None:
             self._active[key] = (after.channel.id, now)
+
+    async def _touch_names(self, member: discord.Member, *channels) -> None:
+        now = int(discord.utils.utcnow().timestamp())
+        channel_rows = [
+            (member.guild.id, channel.id, channel.name, now)
+            for channel in channels
+            if channel is not None
+        ]
+
+        def _upsert() -> None:
+            self._db.execute(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.id, member.display_name, now),
+            )
+            self._db.executemany(
+                "INSERT INTO channel_names (guild_id, channel_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, channel_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                channel_rows,
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
 
     async def _log_session(
         self,
@@ -153,6 +211,7 @@ class VoiceLog(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         def _delete() -> None:
             self._db.execute("DELETE FROM voice_sessions WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM user_names WHERE user_id = ?", (user_id,))
             self._db.commit()
 
         async with self._db_lock:

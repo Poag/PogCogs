@@ -192,6 +192,8 @@ A few behavioral differences from ExtendedModLog, all bug fixes rather than inte
 
 Since the two cogs keep separate database files (each in its own cog data folder), that second join needs both files open at once (e.g. SQLite's `ATTACH DATABASE`). Those joins are the intended basis for building a relationship graph from this data. `autovoice` doesn't fit into this - it doesn't log session history, only current live state (room ownership and deny lists).
 
+Both cogs also cache display names keyed by ID - `voicelog` maintains `user_names` and `channel_names`, `gamelog` maintains its own `user_names` - since the session tables above only ever store raw Discord IDs, and anything reading this data directly (rather than through Red/discord.py, which resolves names from its own live cache) needs a name to show. Each is refreshed opportunistically from whichever member/channel object is already in hand when a session starts or stops, not a separate lookup, so there's no meaningful extra cost. Both `user_names` tables are pruned by `red_delete_data_for_user` alongside the session rows.
+
 ## Privileged intents
 
 `gamelog` needs the **Presence Intent** and **Server Members Intent** enabled for the bot, both in the [Discord developer portal](https://discord.com/developers/applications) (under your application's Bot settings) and in Red's own intents config (`redbot-setup` lets you toggle these, or edit the instance's intents). Without both, `gamelog` will never see game activity changes and will log nothing.

@@ -1,11 +1,11 @@
 {
     "author": ["Poag"],
     "min_bot_version": "3.5.0",
-    "description": "Logs who's in voice channels in a server and how long each session lasts. Sessions are logged as plain start/end intervals per user per channel; this cog doesn't compute who was in voice together itself - that, and cross-referencing with the gamelog cog's game activity, is meant to be derived later as the basis for a relationship graph. Requires the Voice States intent to be enabled for the bot.",
+    "description": "Logs who's in voice channels in a server and how long each session lasts. Sessions are logged as plain start/end intervals per user per channel; this cog doesn't compute who was in voice together itself - that, and cross-referencing with the gamelog cog's game activity, is meant to be derived later as the basis for a relationship graph. Also caches each seen member's current display name and each voice channel's name, keyed by ID, for external tools reading this data directly. Requires the Voice States intent to be enabled for the bot.",
     "hidden": false,
     "install_msg": "Thanks for installing VoiceLog! This cog requires the Voice States intent to be enabled for the bot in order to see voice channel activity - see the repo README for details.",
     "short": "Logs per-session voice channel activity for members.",
-    "end_user_data_statement": "This cog stores, per server: a Discord user ID, a voice channel ID, and the start time, end time, and duration of each voice session. This is used to answer in-server voice-time queries via this cog's commands, and may be used to derive relationship data (who was in voice together, cross-referenced with the gamelog cog) in the future. All stored data for a user is deleted when Red processes a data deletion request for that user.",
+    "end_user_data_statement": "This cog stores, per server: a Discord user ID, a voice channel ID, and the start time, end time, and duration of each voice session, plus a cached display name per user ID (refreshed whenever that user is next seen joining/leaving/moving voice channels). This is used to answer in-server voice-time queries via this cog's commands, and may be used to derive relationship data (who was in voice together, cross-referenced with the gamelog cog) in the future. All stored data for a user, including their cached display name, is deleted when Red processes a data deletion request for that user.",
     "requirements": [],
     "tags": ["logging", "voice", "stats"]
 }

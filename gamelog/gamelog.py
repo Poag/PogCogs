@@ -23,6 +23,12 @@ class GameLog(commands.Cog):
     join this cog's ``sessions`` table against ``voicelog``'s
     ``voice_sessions`` table on matching ``user_id`` with overlapping
     ``[start_time, end_time]`` windows.
+
+    Also opportunistically caches display names in ``user_names`` - it
+    only ever stores a Discord *ID*, so anything consuming this database
+    directly (e.g. a dashboard) needs a name to show; refreshed from the
+    member object already in hand whenever a game session starts or
+    stops, rather than a separate lookup.
     """
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -45,6 +51,17 @@ class GameLog(commands.Cog):
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_guild_user_game "
             "ON sessions (guild_id, user_id, game)"
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_names (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
         )
         self._db.commit()
         self._db_lock = asyncio.Lock()
@@ -80,6 +97,8 @@ class GameLog(commands.Cog):
         if before_games == after_games:
             return
 
+        await self._touch_name(after)
+
         now = discord.utils.utcnow()
 
         for game in after_games - before_games:
@@ -96,6 +115,22 @@ class GameLog(commands.Cog):
             if duration <= 0:
                 continue
             await self._log_session(after.guild.id, after.id, game, start, now, duration)
+
+    async def _touch_name(self, member: discord.Member) -> None:
+        now = int(discord.utils.utcnow().timestamp())
+
+        def _upsert() -> None:
+            self._db.execute(
+                "INSERT INTO user_names (guild_id, user_id, name, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (guild_id, user_id) DO UPDATE "
+                "SET name = excluded.name, updated_at = excluded.updated_at",
+                (member.guild.id, member.id, member.display_name, now),
+            )
+            self._db.commit()
+
+        async with self._db_lock:
+            await asyncio.get_running_loop().run_in_executor(None, _upsert)
 
     async def _log_session(
         self,
@@ -245,6 +280,7 @@ class GameLog(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         def _delete() -> None:
             self._db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            self._db.execute("DELETE FROM user_names WHERE user_id = ?", (user_id,))
             self._db.commit()
 
         async with self._db_lock:
